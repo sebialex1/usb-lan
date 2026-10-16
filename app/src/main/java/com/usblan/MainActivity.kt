@@ -1,5 +1,6 @@
 package com.usblan
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
@@ -92,6 +93,8 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------------- UI
 
+    // Pre-API-33 registerReceiver has no export flags (see the else branch below).
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
@@ -115,6 +118,8 @@ class MainActivity : Activity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
         } else {
+            // Before API 33 there are no export flags; this overload is the
+            // only option and matches the exported behaviour above.
             registerReceiver(receiver, filter)
         }
 
