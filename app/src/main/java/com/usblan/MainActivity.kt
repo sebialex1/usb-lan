@@ -20,6 +20,7 @@ import android.os.Looper
 import android.view.Gravity
 import android.widget.LinearLayout
 import android.widget.TextView
+import java.lang.ref.WeakReference
 import java.util.Locale
 
 class MainActivity : Activity() {
@@ -51,6 +52,7 @@ class MainActivity : Activity() {
     @Volatile private var link: Link? = null
     @Volatile private var role = Role.NONE
     @Volatile private var handshakeDone = false
+    @Volatile private var destroyed = false
     /** Devices (by deviceId) we already ran the AOA handshake on. */
     private val aoaAttempted = mutableSetOf<Int>()
     /** Devices (by deviceId) with an outstanding USB permission request. */
@@ -313,7 +315,9 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        if (link == null) {
+        // A recreated activity must not open a second USB connection while
+        // the service (or a pending handoff) still owns the live link.
+        if (link == null && !adoptServiceLink()) {
             usbManager.accessoryList?.firstOrNull()?.let(::onAccessoryAttached)
             if (link == null) usbManager.deviceList.values.forEach(::onDeviceAttached)
         }
@@ -321,6 +325,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        destroyed = true
         handler.removeCallbacks(uiLoop)
         cancelHelloRetry()
         try {
@@ -343,6 +348,7 @@ class MainActivity : Activity() {
         d.vendorId == GOOGLE_VID && (d.productId == AOA_PID_2D00 || d.productId == AOA_PID_2D01)
 
     private fun onDeviceAttached(device: UsbDevice) {
+        if (adoptServiceLink()) return
         if (link != null || role != Role.NONE) return
         if (isAccessoryEnumeration(device)) {
             connectHost(device)
@@ -389,6 +395,7 @@ class MainActivity : Activity() {
 
     /** Ask the peer to re-enumerate as an Android accessory. */
     private fun beginHandshake(device: UsbDevice) {
+        if (serviceLink() != null) return
         // Permission first; serialNumber and openDevice need it. The grant
         // broadcast re-enters onDeviceAttached and lands here again.
         if (!ensureDevicePermission(device)) return
@@ -434,6 +441,7 @@ class MainActivity : Activity() {
     /** This phone is the USB host; talk to the peer which is now an accessory. */
     private fun connectHost(device: UsbDevice) {
         if (link != null || role != Role.NONE) return
+        if (serviceLink() != null) return // never open a second connection
         if (!ensureDevicePermission(device)) return
         val connection = usbManager.openDevice(device) ?: return
         val pair = findBulkPair(device)
@@ -482,6 +490,7 @@ class MainActivity : Activity() {
 
     /** This phone is in accessory mode; the host opened us. */
     private fun onAccessoryAttached(accessory: UsbAccessory) {
+        if (adoptServiceLink()) return
         if (link != null || role != Role.NONE) return
         if (!usbManager.hasPermission(accessory)) {
             if (!accessoryPermissionPending && !accessoryPermissionDenied) {
@@ -499,25 +508,75 @@ class MainActivity : Activity() {
         attachLink(AccessoryLink(Role.DEVICE, pfd))
     }
 
+    /** The link the VPN service owns or is about to take over, if any. */
+    private fun serviceLink(): Link? = LanVpnService.activeLink ?: LanVpnService.pendingLink
+
+    /**
+     * If the service already owns a link (activity recreated while the LAN
+     * is up), show that link instead of opening a second USB connection,
+     * which could steal the interface claim from the live one. Returns true
+     * if a service-owned link exists (adopted now or earlier).
+     */
+    private fun adoptServiceLink(): Boolean {
+        val l = serviceLink() ?: return false
+        if (link === l) return true
+        cancelHelloRetry()
+        link = l
+        role = l.role
+        // The service only receives links whose handshake completed.
+        handshakeDone = true
+        installDisplayCallbacks(l)
+        render()
+        return true
+    }
+
     private fun attachLink(l: Link) {
         link = l
         role = l.role
         handshakeDone = false
-        l.onControl = { message -> onControlMessage(message) }
-        l.onClosed = {
-            handler.post {
-                if (link === l) {
-                    cancelHelloRetry()
-                    link = null
-                    role = Role.NONE
-                    handshakeDone = false
-                    render()
-                }
-            }
-        }
+        installDisplayCallbacks(l)
         // Callbacks are in place; only now may the reader see frames.
         l.start()
         render()
+    }
+
+    /**
+     * Install this activity's control/close handling on [l], chaining any
+     * callbacks already present (the service chains onClosed to stop the
+     * VPN; earlier activity instances may have installed theirs). Only a
+     * weak reference to the activity is captured so destroyed instances
+     * left in the chain can be collected and become no-ops.
+     */
+    private fun installDisplayCallbacks(l: Link) {
+        val ref = WeakReference(this)
+        val previousOnControl = l.onControl
+        l.onControl = { message ->
+            try {
+                previousOnControl?.invoke(message)
+            } finally {
+                ref.get()?.takeUnless { it.destroyed }?.onControlMessage(message)
+            }
+        }
+        val previousOnClosed = l.onClosed
+        l.onClosed = {
+            try {
+                previousOnClosed?.invoke()
+            } finally {
+                ref.get()?.takeUnless { it.destroyed }?.onLinkClosed(l)
+            }
+        }
+    }
+
+    private fun onLinkClosed(l: Link) {
+        handler.post {
+            if (link === l) {
+                cancelHelloRetry()
+                link = null
+                role = Role.NONE
+                handshakeDone = false
+                render()
+            }
+        }
     }
 
     private fun onControlMessage(message: String) {
