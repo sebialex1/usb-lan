@@ -38,6 +38,7 @@ class MainActivity : Activity() {
         private const val HELLO_RETRY_MS = 2500L
         private const val HELLO_MAX_ATTEMPTS = 3
         private const val UPDATE_LABEL = "Check for updates"
+        private const val PING_INTERVAL_MS = 2000L
     }
 
     private lateinit var usbManager: UsbManager
@@ -68,6 +69,7 @@ class MainActivity : Activity() {
     private var accessoryPermissionPending = false
     private var accessoryPermissionDenied = false
     private var helloRetry: Runnable? = null
+    private var pingLoop: Runnable? = null
     private lateinit var permissionPi: PendingIntent
 
     private val receiver = object : BroadcastReceiver() {
@@ -209,26 +211,58 @@ class MainActivity : Activity() {
                 statusView.setTextColor(Color.BLACK)
                 detailView.text =
                     "The LAN needs VPN permission (one-time).\n" +
-                        "Tap anywhere on this screen to grant it."
-                statsView.text = ""
+                        "Tap anywhere on this screen to grant it." + sessionLine(l)
+                statsView.text = pingText(l)
             }
             !peerTunUp -> {
                 statusView.text = "Starting"
                 statusView.setTextColor(Color.parseColor("#9E9E9E"))
                 detailView.text =
                     "Waiting for the other phone's VPN.\n" +
-                        "If it asks for VPN permission, allow it there."
-                statsView.text = ""
+                        "If it asks for VPN permission, allow it there." + sessionLine(l)
+                statsView.text = pingText(l)
             }
             else -> {
                 statusView.text = "Connected"
                 statusView.setTextColor(Color.parseColor("#1B7F3B"))
                 detailView.text =
                     "This device  ${LanVpnService.myIp(role)}\n" +
-                        "Peer        ${LanVpnService.peerIp(role)}"
-                statsView.text = "rx ${fmtBytes(l.rxBytes)}  tx ${fmtBytes(l.txBytes)}"
+                        "Peer        ${LanVpnService.peerIp(role)}" + sessionLine(l)
+                statsView.text =
+                    pingText(l) + "\nrx ${fmtBytes(l.rxBytes)}  tx ${fmtBytes(l.txBytes)}"
             }
         }
+    }
+
+    /** Connection test: both phones must show the same session number. */
+    private fun sessionLine(l: Link): String =
+        "\nsession ${LinkSession.sid(l)?.toString() ?: "-"}"
+
+    private fun pingText(l: Link): String =
+        LinkSession.rtt(l)?.let { "ping $it ms" } ?: "ping -"
+
+    /** Host: once the handshake is done, ping every PING_INTERVAL_MS while this activity lives. */
+    private fun startPingLoop(l: Link) {
+        if (l.role != Role.HOST) return
+        stopPingLoop()
+        LinkSession.hostStart(l)
+        val r = object : Runnable {
+            override fun run() {
+                if (link !== l || !handshakeDone || destroyed) {
+                    if (pingLoop === this) pingLoop = null
+                    return
+                }
+                LinkSession.hostTick(l)
+                handler.postDelayed(this, PING_INTERVAL_MS)
+            }
+        }
+        pingLoop = r
+        r.run()
+    }
+
+    private fun stopPingLoop() {
+        pingLoop?.let(handler::removeCallbacks)
+        pingLoop = null
     }
 
     private fun onRootTap() {
@@ -337,6 +371,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         destroyed = true
         handler.removeCallbacks(uiLoop)
+        stopPingLoop()
         cancelHelloRetry()
         try {
             unregisterReceiver(receiver)
@@ -538,6 +573,7 @@ class MainActivity : Activity() {
         // The peer's TUNUP may have arrived before this instance existed.
         peerTunUp = LanVpnService.peerTunUpLink === l
         installDisplayCallbacks(l)
+        startPingLoop(l)
         render()
         return true
     }
@@ -567,14 +603,20 @@ class MainActivity : Activity() {
             // Record the peer's TUN state process-wide even if this activity
             // is gone, so a recreated activity can still show "Connected".
             if (message == "TUNUP") LanVpnService.peerTunUpLink = l
-            try {
-                previousOnControl?.invoke(message)
-            } finally {
-                ref.get()?.takeUnless { it.destroyed }?.onControlMessage(message)
+            // Connection-test lines (SID/PNG/RTT) are handled exactly once,
+            // here in the newest callback, never by older chained ones.
+            if (!LinkSession.onControl(l, message)) {
+                try {
+                    previousOnControl?.invoke(message)
+                } finally {
+                    ref.get()?.takeUnless { it.destroyed }?.onControlMessage(message)
+                }
             }
         }
         val previousOnClosed = l.onClosed
         l.onClosed = {
+            LinkSession.clear(l)
+            if (LanVpnService.peerTunUpLink === l) LanVpnService.peerTunUpLink = null
             try {
                 previousOnClosed?.invoke()
             } finally {
@@ -584,10 +626,10 @@ class MainActivity : Activity() {
     }
 
     private fun onLinkClosed(l: Link) {
-        if (LanVpnService.peerTunUpLink === l) LanVpnService.peerTunUpLink = null
         handler.post {
             if (link === l) {
                 cancelHelloRetry()
+                stopPingLoop()
                 link = null
                 role = Role.NONE
                 handshakeDone = false
@@ -624,6 +666,7 @@ class MainActivity : Activity() {
                     cancelHelloRetry()
                     if (!handshakeDone) {
                         handshakeDone = true
+                        link?.let(::startPingLoop)
                         startVpn()
                     }
                     render()
@@ -637,6 +680,8 @@ class MainActivity : Activity() {
         // detach happens before the link exists and is therefore a no-op.
         val l = link ?: return
         cancelHelloRetry()
+        stopPingLoop()
+        LinkSession.clear(l)
         link = null
         role = Role.NONE
         handshakeDone = false
