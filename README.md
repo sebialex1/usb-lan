@@ -2,7 +2,7 @@
 
 Android app that links two phones over a USB-C cable and gives them a small IPv4 LAN. Any app on either phone can use it: the phones get `10.7.0.1` and `10.7.0.2` on `10.7.0.0/24`.
 
-Status: experimental. The app builds; phone-to-phone operation has not been tested on hardware.
+Status: experimental. The app builds and releases are signed. Phone-to-phone operation has not been tested on hardware.
 
 ## How it works
 
@@ -19,6 +19,13 @@ Status: experimental. The app builds; phone-to-phone operation has not been test
 5. When the screen shows "Connected", use `10.7.0.1` (host phone) and `10.7.0.2` (accessory phone) from any app, e.g. a web server on one phone and a browser on the other.
 
 Unplugging the cable stops the LAN.
+
+## Updates
+
+Releases from v0.2.0 on are signed with a fixed release key, so a newer release installs over an older one and keeps the app's settings.
+
+- **Coming from v0.1.x:** those builds were debug-signed with a different key. Uninstall the v0.1.x app first, then install the signed release. Android refuses to install over an app signed with a different key.
+- **In-app updates:** tap "Check for updates" at the bottom of the screen. The app reads the newest release (prereleases included) from GitHub. If that release is newer than the installed version, the app downloads its APK and opens the system installer. The first time, Android asks you to allow "Install unknown apps" for USB LAN. Allow it, then tap the button again.
 
 ## Requirements
 
@@ -43,4 +50,14 @@ export ANDROID_HOME=/path/to/android-sdk
 
 The APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
 
-A manual GitHub Actions workflow (`.github/workflows/build.yml`) builds the APK and publishes it as a prerelease for a given tag.
+A signed release build:
+
+```sh
+./gradlew assembleRelease
+```
+
+The APK is written to `app/build/outputs/apk/release/app-release.apk`, signed with `keystore/usblan-release.keystore`. The passwords are in `keystore/keystore.properties`.
+
+**Security note:** the release keystore and its passwords are committed to this repository on purpose, so CI and anyone else can build updates that install over existing installs. It also means anyone can sign an APK that Android accepts as an update to `com.usblan`. That is acceptable for a personal tool. Do not reuse this key for anything else. Install only APKs from this repo's releases.
+
+A manual GitHub Actions workflow (`.github/workflows/build.yml`) builds the signed release APK and publishes it as a prerelease. The `tag` input is optional: if it is empty, the workflow uses `v0.2.<run number>`. The workflow sets the app's `versionName` to the tag without the leading `v`, so the in-app update check compares the right versions.
