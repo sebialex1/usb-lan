@@ -158,7 +158,12 @@ abstract class BaseLink(override val role: Role) : Link {
         }
     }
 
-    init {
+    /**
+     * Must be called at the END of each subclass init block. Starting the
+     * threads from the BaseLink constructor would let them observe subclass
+     * fields before they are assigned.
+     */
+    protected fun startThreads() {
         reader.name = "usblan-reader-${role.name.lowercase()}"
         writer.name = "usblan-writer-${role.name.lowercase()}"
         reader.start()
@@ -207,6 +212,10 @@ class HostLink(
     private val endpointOut: UsbEndpoint,
 ) : BaseLink(role) {
 
+    init {
+        startThreads()
+    }
+
     override fun readChunk(buffer: ByteArray): Int {
         val n = connection.bulkTransfer(endpointIn, buffer, buffer.size, 250)
         if (n >= 0) return n
@@ -245,6 +254,10 @@ class AccessoryLink(
 
     private val input = FileInputStream(pfd.fileDescriptor)
     private val output = FileOutputStream(pfd.fileDescriptor)
+
+    init {
+        startThreads()
+    }
 
     override fun readChunk(buffer: ByteArray): Int = try {
         input.read(buffer)
