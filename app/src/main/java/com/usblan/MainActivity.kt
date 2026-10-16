@@ -36,6 +36,7 @@ class MainActivity : Activity() {
         private const val UI_UPDATE_MS = 400L
         private const val HELLO_RETRY_MS = 2500L
         private const val HELLO_MAX_ATTEMPTS = 3
+        private const val UPDATE_LABEL = "Check for updates"
     }
 
     private lateinit var usbManager: UsbManager
@@ -43,6 +44,8 @@ class MainActivity : Activity() {
     private lateinit var detailView: TextView
     private lateinit var statsView: TextView
     private lateinit var rootView: LinearLayout
+    private lateinit var updateView: TextView
+    @Volatile private var updateBusy = false
     private val handler = Handler(Looper.getMainLooper())
 
     @Volatile private var link: Link? = null
@@ -158,7 +161,17 @@ class MainActivity : Activity() {
         rootView.addView(title)
         rootView.addView(statusView)
         rootView.addView(detailView)
+        updateView = TextView(this).apply {
+            text = UPDATE_LABEL
+            textSize = 12f
+            setTextColor(Color.parseColor("#9E9E9E"))
+            gravity = Gravity.CENTER
+            // Generous padding makes the small text an easy tap target.
+            setPadding(pad, pad * 2, pad, pad / 2)
+            setOnClickListener { onUpdateTap() }
+        }
         rootView.addView(statsView)
+        rootView.addView(updateView)
         rootView.setOnClickListener { onRootTap() }
         setContentView(rootView)
     }
@@ -231,6 +244,63 @@ class MainActivity : Activity() {
         LanVpnService.pendingLink = l
         startForegroundService(Intent(this, LanVpnService::class.java))
         render()
+    }
+
+    // ------------------------------------------------------------- updates
+
+    private fun onUpdateTap() {
+        if (updateBusy) return
+        updateBusy = true
+        updateView.text = "Checking for updates..."
+        val app = applicationContext
+        Thread {
+            Thread.currentThread().name = "usblan-update"
+            val message: String? = try {
+                when (val r = Updater.check(app) { msg -> handler.post { showUpdateStatus(msg) } }) {
+                    is Updater.Result.UpToDate -> "Up to date (${r.installed})"
+                    is Updater.Result.NoApk -> "${r.release.tag} has no APK attached"
+                    is Updater.Result.Downloaded -> {
+                        handler.post { installUpdate(r) }
+                        null
+                    }
+                }
+            } catch (e: Exception) {
+                "Update check failed: ${e.message ?: e.javaClass.simpleName}"
+            }
+            if (message != null) {
+                handler.post {
+                    updateBusy = false
+                    showUpdateStatus(message)
+                    resetUpdateLabelLater()
+                }
+            }
+        }.start()
+    }
+
+    private fun installUpdate(r: Updater.Result.Downloaded) {
+        updateBusy = false
+        if (isFinishing || isDestroyed) return
+        try {
+            if (!Updater.canInstall(this)) {
+                // One-time: allow "Install unknown apps" for USB LAN, then tap again.
+                showUpdateStatus("Allow installs from USB LAN, then tap again")
+                Updater.openInstallPermissionSettings(this)
+            } else {
+                showUpdateStatus("Installing ${r.release.tag}...")
+                Updater.launchInstaller(this, r.file)
+            }
+        } catch (e: Exception) {
+            showUpdateStatus("Could not start installer: ${e.message ?: e.javaClass.simpleName}")
+        }
+        resetUpdateLabelLater()
+    }
+
+    private fun showUpdateStatus(text: String) {
+        if (!isDestroyed) updateView.text = text
+    }
+
+    private fun resetUpdateLabelLater() {
+        handler.postDelayed({ if (!updateBusy) showUpdateStatus(UPDATE_LABEL) }, 6000)
     }
 
     private fun fmtBytes(v: Long): String {
