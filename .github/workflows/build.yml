@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag"
+        description: "Release tag (empty = v0.2.<run number>)"
         type: string
-        required: true
-        default: v0.1.0
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: ${{ inputs.tag }}
+      TAG: ${{ inputs.tag != '' && inputs.tag || format('v0.2.{0}', github.run_number) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -28,13 +28,13 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Build debug APK
-        run: chmod +x gradlew && ./gradlew assembleDebug --no-daemon
+      - name: Build signed release APK
+        run: chmod +x gradlew && ./gradlew assembleRelease --no-daemon -PversionNameOverride="${TAG#v}"
 
       - name: Collect APK
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk "dist/usb-lan-${TAG}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "dist/usb-lan-${TAG}.apk"
 
       - name: Create prerelease
         run: |
@@ -43,4 +43,4 @@ jobs:
             --target "${GITHUB_SHA}" \
             --title "USB LAN ${TAG}" \
             --prerelease \
-            --notes "Experimental build. Debug-signed APK built from ${GITHUB_SHA}. Creates an IPv4 LAN (10.7.0.1 / 10.7.0.2) between two Android phones over a USB-C cable using Android Open Accessory and a VpnService TUN. Build-verified only; not tested on hardware. Install the same APK on both phones."
+            --notes "Experimental build. Signed release APK built from ${GITHUB_SHA}. Updates install over previous SIGNED versions (v0.2.0 and later); if you have a debug v0.1.x build installed, uninstall it first (different signing key). Creates an IPv4 LAN (10.7.0.1 / 10.7.0.2) between two Android phones over a USB-C cable using Android Open Accessory and a VpnService TUN. Build-verified only; not tested on hardware. Install the same APK on both phones."
