@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (empty = v0.2.<run number>)"
+        description: "Release tag (empty = v0.3.<run number>)"
         type: string
         required: false
         default: ""
@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: ${{ inputs.tag != '' && inputs.tag || format('v0.2.{0}', github.run_number) }}
+      TAG: ${{ inputs.tag != '' && inputs.tag || format('v0.3.{0}', github.run_number) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -29,7 +29,23 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
 
       - name: Build signed release APK
-        run: chmod +x gradlew && ./gradlew assembleRelease --no-daemon -PversionNameOverride="${TAG#v}"
+        env:
+          USBLAN_KEYSTORE_BASE64: ${{ secrets.USBLAN_KEYSTORE_BASE64 }}
+          USBLAN_KEYSTORE_PASSWORD: ${{ secrets.USBLAN_KEYSTORE_PASSWORD }}
+          USBLAN_KEY_ALIAS: ${{ secrets.USBLAN_KEY_ALIAS }}
+          USBLAN_KEY_PASSWORD: ${{ secrets.USBLAN_KEY_PASSWORD }}
+        run: |
+          if [ -z "${USBLAN_KEYSTORE_BASE64}" ]; then
+            echo "::error::USBLAN_KEYSTORE_BASE64 secret is not set; refusing to publish an unsigned release"
+            exit 1
+          fi
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon -PversionNameOverride="${TAG#v}"
+
+      - name: Verify APK signature
+        run: |
+          APKSIGNER="$(ls -d "${ANDROID_HOME}"/build-tools/*/apksigner | sort -V | tail -n1)"
+          "${APKSIGNER}" verify --print-certs app/build/outputs/apk/release/app-release.apk
 
       - name: Collect APK
         run: |
@@ -43,4 +59,4 @@ jobs:
             --target "${GITHUB_SHA}" \
             --title "USB LAN ${TAG}" \
             --prerelease \
-            --notes "Experimental build. Signed release APK built from ${GITHUB_SHA}. Updates install over previous SIGNED versions (v0.2.0 and later); if you have a debug v0.1.x build installed, uninstall it first (different signing key). Creates an IPv4 LAN (10.7.0.1 / 10.7.0.2) between two Android phones over a USB-C cable using Android Open Accessory and a VpnService TUN. Build-verified only; not tested on hardware. Install the same APK on both phones."
+            --notes "Experimental build. Signed release APK built from ${GITHUB_SHA}. Signed with the release key kept in GitHub Actions secrets (new key since v0.3.0). If you have v0.2.x or a debug v0.1.x build installed, uninstall it once first (different signing key); later releases install over v0.3.0. Creates an IPv4 LAN (10.7.0.1 / 10.7.0.2) between two Android phones over a USB-C cable using Android Open Accessory and a VpnService TUN. Build-verified only; not tested on hardware. Install the same APK on both phones."

@@ -7,3 +7,8 @@ build/
 captures/
 .externalNativeBuild
 .cxx
+
+# Release signing material: never commit. CI uses GitHub Actions secrets.
+keystore/
+*.keystore
+*.jks

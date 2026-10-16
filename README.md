@@ -22,9 +22,9 @@ Unplugging the cable stops the LAN.
 
 ## Updates
 
-Releases from v0.2.0 on are signed with a fixed release key, so a newer release installs over an older one and keeps the app's settings.
+Releases are signed with a release key that is kept only in GitHub Actions secrets; it is not in this repository. From v0.3.0 on, a newer release installs over an older one and keeps the app's settings.
 
-- **Coming from v0.1.x:** those builds were debug-signed with a different key. Uninstall the v0.1.x app first, then install the signed release. Android refuses to install over an app signed with a different key.
+- **Coming from v0.2.0 or a debug v0.1.x build: uninstall once.** v0.3.0 is signed with a new key (the v0.2.0 key was published in this repo's history and is retired; v0.1.x builds were debug-signed). Android refuses to install over an app signed with a different key, so the in-app updater cannot move you from those versions either. Uninstall the old app, then install v0.3.0 or later.
 - **In-app updates:** tap "Check for updates" at the bottom of the screen. The app reads the newest release (prereleases included) from GitHub. If that release is newer than the installed version, the app downloads its APK and opens the system installer. The first time, Android asks you to allow "Install unknown apps" for USB LAN. Allow it, then tap the button again.
 
 ## Requirements
@@ -56,8 +56,10 @@ A signed release build:
 ./gradlew assembleRelease
 ```
 
-The APK is written to `app/build/outputs/apk/release/app-release.apk`, signed with `keystore/usblan-release.keystore`. The passwords are in `keystore/keystore.properties`.
+The APK is written to `app/build/outputs/apk/release/app-release.apk`. Signing material is never committed (`keystore/` is git-ignored). The build looks for it in this order:
 
-**Security note:** the release keystore and its passwords are committed to this repository on purpose, so CI and anyone else can build updates that install over existing installs. It also means anyone can sign an APK that Android accepts as an update to `com.usblan`. That is acceptable for a personal tool. Do not reuse this key for anything else. Install only APKs from this repo's releases.
+1. Environment variables (used by CI): `USBLAN_KEYSTORE_BASE64` (the keystore, base64), `USBLAN_KEYSTORE_PASSWORD`, `USBLAN_KEY_ALIAS`, `USBLAN_KEY_PASSWORD`.
+2. A local, untracked `keystore/keystore.properties` with `storeFile` (relative to `keystore/`), `storePassword`, `keyAlias`, `keyPassword`.
+3. Neither: the release APK is built unsigned. An unsigned or differently signed APK will not install over the published releases.
 
-A manual GitHub Actions workflow (`.github/workflows/build.yml`) builds the signed release APK and publishes it as a prerelease. The `tag` input is optional: if it is empty, the workflow uses `v0.2.<run number>`. The workflow sets the app's `versionName` to the tag without the leading `v`, so the in-app update check compares the right versions.
+A manual GitHub Actions workflow (`.github/workflows/build.yml`) builds the release APK, signs it with the key from the repository secrets above, and publishes it as a prerelease. The `tag` input is optional: if it is empty, the workflow uses `v0.3.<run number>`. The workflow sets the app's `versionName` to the tag without the leading `v`, so the in-app update check compares the right versions.
