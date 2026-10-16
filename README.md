@@ -16,7 +16,7 @@ Status: experimental. The app builds and releases are signed. Phone-to-phone ope
 2. Open the app on at least one phone.
 3. Connect the phones with a USB-C cable.
 4. Accept the USB permission prompts, then grant VPN permission when asked (tap the screen if it shows "Tap to allow VPN").
-5. When the screen shows "Connected", use `10.7.0.1` (host phone) and `10.7.0.2` (accessory phone) from any app, e.g. a web server on one phone and a browser on the other.
+5. "Starting" means this phone's VPN is up and it is waiting for the other phone's. When the screen shows "Connected" (both VPNs are up), use `10.7.0.1` (host phone) and `10.7.0.2` (accessory phone) from any app, e.g. a web server on one phone and a browser on the other.
 
 Unplugging the cable stops the LAN.
 

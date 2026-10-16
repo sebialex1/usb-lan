@@ -53,6 +53,8 @@ class MainActivity : Activity() {
     @Volatile private var role = Role.NONE
     @Volatile private var handshakeDone = false
     @Volatile private var destroyed = false
+    /** The peer reported (control "TUNUP") that its VPN/TUN is up. */
+    @Volatile private var peerTunUp = false
     /** Devices (by deviceId) we already ran the AOA handshake on. */
     private val aoaAttempted = mutableSetOf<Int>()
     /** Devices (by deviceId) with an outstanding USB permission request. */
@@ -208,6 +210,14 @@ class MainActivity : Activity() {
                 detailView.text =
                     "The LAN needs VPN permission (one-time).\n" +
                         "Tap anywhere on this screen to grant it."
+                statsView.text = ""
+            }
+            !peerTunUp -> {
+                statusView.text = "Starting"
+                statusView.setTextColor(Color.parseColor("#9E9E9E"))
+                detailView.text =
+                    "Waiting for the other phone's VPN.\n" +
+                        "If it asks for VPN permission, allow it there."
                 statsView.text = ""
             }
             else -> {
@@ -525,6 +535,8 @@ class MainActivity : Activity() {
         role = l.role
         // The service only receives links whose handshake completed.
         handshakeDone = true
+        // The peer's TUNUP may have arrived before this instance existed.
+        peerTunUp = LanVpnService.peerTunUpLink === l
         installDisplayCallbacks(l)
         render()
         return true
@@ -534,6 +546,7 @@ class MainActivity : Activity() {
         link = l
         role = l.role
         handshakeDone = false
+        peerTunUp = false
         installDisplayCallbacks(l)
         // Callbacks are in place; only now may the reader see frames.
         l.start()
@@ -551,6 +564,9 @@ class MainActivity : Activity() {
         val ref = WeakReference(this)
         val previousOnControl = l.onControl
         l.onControl = { message ->
+            // Record the peer's TUN state process-wide even if this activity
+            // is gone, so a recreated activity can still show "Connected".
+            if (message == "TUNUP") LanVpnService.peerTunUpLink = l
             try {
                 previousOnControl?.invoke(message)
             } finally {
@@ -568,12 +584,14 @@ class MainActivity : Activity() {
     }
 
     private fun onLinkClosed(l: Link) {
+        if (LanVpnService.peerTunUpLink === l) LanVpnService.peerTunUpLink = null
         handler.post {
             if (link === l) {
                 cancelHelloRetry()
                 link = null
                 role = Role.NONE
                 handshakeDone = false
+                peerTunUp = false
                 render()
             }
         }
@@ -581,6 +599,15 @@ class MainActivity : Activity() {
 
     private fun onControlMessage(message: String) {
         when {
+            message == "TUNUP" -> {
+                val l = link
+                handler.post {
+                    if (link === l && l != null) {
+                        peerTunUp = true
+                        render()
+                    }
+                }
+            }
             message == "HELLO:1" && role == Role.DEVICE -> {
                 // The host may resend HELLO if our READY was lost; always answer.
                 link?.sendControl("READY")
@@ -613,6 +640,7 @@ class MainActivity : Activity() {
         link = null
         role = Role.NONE
         handshakeDone = false
+        peerTunUp = false
         l.close()
         render()
     }

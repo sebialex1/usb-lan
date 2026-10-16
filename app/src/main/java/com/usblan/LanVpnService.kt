@@ -32,6 +32,10 @@ class LanVpnService : VpnService() {
         @Volatile
         var activeLink: Link? = null
 
+        /** Link on which the peer reported its TUN up ("TUNUP"); set by MainActivity's callbacks. */
+        @Volatile
+        var peerTunUpLink: Link? = null
+
         fun myIp(role: Role): String = if (role == Role.HOST) "$SUBNET.1" else "$SUBNET.2"
         fun peerIp(role: Role): String = if (role == Role.HOST) "$SUBNET.2" else "$SUBNET.1"
     }
@@ -92,6 +96,9 @@ class LanVpnService : VpnService() {
             tunIn = FileInputStream(fd.fileDescriptor)
             tunOut = FileOutputStream(fd.fileDescriptor)
             startPumps(l)
+            // Tell the peer our TUN is up; its UI shows "Connected" only
+            // after it gets this.
+            l.sendControl("TUNUP")
         }
     }
 
@@ -160,6 +167,7 @@ class LanVpnService : VpnService() {
     }
 
     private fun cleanup() {
+        if (peerTunUpLink === link) peerTunUpLink = null
         activeLink = null
         link?.close()
         link = null
