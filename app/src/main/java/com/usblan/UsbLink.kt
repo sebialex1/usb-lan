@@ -5,6 +5,7 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.concurrent.LinkedBlockingQueue
@@ -32,6 +33,14 @@ interface Link {
     var onPacket: ((ByteArray, Int) -> Unit)?
     var onControl: ((String) -> Unit)?
     var onClosed: (() -> Unit)?
+
+    /**
+     * Start the reader/writer threads. Call only after the callbacks above
+     * are installed, otherwise early frames (e.g. the single HELLO/READY
+     * control message) could be consumed and dropped. Frames queued with
+     * [sendControl]/[sendPacket] before start() are sent once it runs.
+     */
+    fun start()
 
     fun sendControl(text: String)
     fun sendPacket(data: ByteArray, length: Int)
@@ -100,6 +109,7 @@ private class FrameDecoder(
 abstract class BaseLink(override val role: Role) : Link {
 
     protected val closed = AtomicBoolean(false)
+    private val started = AtomicBoolean(false)
     private val outbox = LinkedBlockingQueue<ByteArray>(256)
     private val rxCtr = AtomicLong(0)
     private val txCtr = AtomicLong(0)
@@ -159,11 +169,13 @@ abstract class BaseLink(override val role: Role) : Link {
     }
 
     /**
-     * Must be called at the END of each subclass init block. Starting the
-     * threads from the BaseLink constructor would let them observe subclass
-     * fields before they are assigned.
+     * Threads are created with the object but only started here, after the
+     * owner has installed its callbacks (and after subclass construction has
+     * finished, so the threads never observe unassigned subclass fields).
+     * Idempotent.
      */
-    protected fun startThreads() {
+    override fun start() {
+        if (!started.compareAndSet(false, true)) return
         reader.name = "usblan-reader-${role.name.lowercase()}"
         writer.name = "usblan-writer-${role.name.lowercase()}"
         reader.start()
@@ -212,24 +224,60 @@ class HostLink(
     private val endpointOut: UsbEndpoint,
 ) : BaseLink(role) {
 
-    init {
-        startThreads()
+    private companion object {
+        const val READ_TIMEOUT_MS = 250
+        const val WRITE_TIMEOUT_MS = 500
+        /** Give a slow peer (app still opening the accessory) this long per frame. */
+        const val WRITE_DEADLINE_MS = 5000L
+        /** Consecutive hard errors (with no data) before the link is declared dead. */
+        const val MAX_CONSECUTIVE_ERRORS = 20
     }
 
+    /** Only touched by the reader thread. */
+    private var readErrors = 0
+
     override fun readChunk(buffer: ByteArray): Int {
-        val n = connection.bulkTransfer(endpointIn, buffer, buffer.size, 250)
-        if (n >= 0) return n
-        // bulkTransfer returns -1 both for timeout and error; only treat it as
-        // fatal once we are closing, otherwise it is just a poll timeout.
-        return if (closed.get()) -1 else 0
+        if (closed.get()) return -1
+        val t0 = SystemClock.elapsedRealtime()
+        val n = connection.bulkTransfer(endpointIn, buffer, buffer.size, READ_TIMEOUT_MS)
+        if (n >= 0) {
+            readErrors = 0
+            return n
+        }
+        // bulkTransfer returns -1 both for a poll timeout and a hard error
+        // (e.g. cable unplugged). A timeout takes ~READ_TIMEOUT_MS; a hard
+        // error returns immediately. Only count the fast failures, so an idle
+        // but healthy link is not torn down, while an unplugged device stops
+        // the reader instead of spinning forever.
+        val elapsed = SystemClock.elapsedRealtime() - t0
+        if (elapsed >= READ_TIMEOUT_MS / 2) {
+            readErrors = 0
+            return 0
+        }
+        readErrors++
+        return if (readErrors >= MAX_CONSECUTIVE_ERRORS) -1 else 0
     }
 
     override fun writeChunk(data: ByteArray, length: Int): Boolean {
         var offset = 0
+        var errors = 0
+        val deadline = SystemClock.elapsedRealtime() + WRITE_DEADLINE_MS
         while (offset < length) {
-            val n = connection.bulkTransfer(endpointOut, data, offset, length - offset, 500)
-            if (n <= 0) return false
-            offset += n
+            if (closed.get()) return false
+            val t0 = SystemClock.elapsedRealtime()
+            val n = connection.bulkTransfer(endpointOut, data, offset, length - offset, WRITE_TIMEOUT_MS)
+            if (n > 0) {
+                offset += n
+                errors = 0
+                continue
+            }
+            // Timeout: the peer is not reading yet (e.g. its app is still
+            // opening the accessory). Retry until the per-frame deadline.
+            // Fast failure: hard error; give up after a few in a row.
+            val now = SystemClock.elapsedRealtime()
+            val timedOut = now - t0 >= WRITE_TIMEOUT_MS / 2
+            if (!timedOut && ++errors >= 3) return false
+            if (now >= deadline) return false
         }
         return true
     }
@@ -254,10 +302,6 @@ class AccessoryLink(
 
     private val input = FileInputStream(pfd.fileDescriptor)
     private val output = FileOutputStream(pfd.fileDescriptor)
-
-    init {
-        startThreads()
-    }
 
     override fun readChunk(buffer: ByteArray): Int = try {
         input.read(buffer)

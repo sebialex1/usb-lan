@@ -34,6 +34,8 @@ class MainActivity : Activity() {
         private const val REQ_START = 53
         private const val REQ_VPN_CONSENT = 42
         private const val UI_UPDATE_MS = 400L
+        private const val HELLO_RETRY_MS = 2500L
+        private const val HELLO_MAX_ATTEMPTS = 3
     }
 
     private lateinit var usbManager: UsbManager
@@ -46,22 +48,35 @@ class MainActivity : Activity() {
     @Volatile private var link: Link? = null
     @Volatile private var role = Role.NONE
     @Volatile private var handshakeDone = false
-    private val aoaAttempted = mutableSetOf<String>()
+    /** Devices (by deviceId) we already ran the AOA handshake on. */
+    private val aoaAttempted = mutableSetOf<Int>()
+    /** Devices (by deviceId) with an outstanding USB permission request. */
+    private val pendingPermission = mutableSetOf<Int>()
+    /**
+     * Devices (by deviceId) the user denied. onResume rescans every device,
+     * and the permission dialog closing resumes us, so without this a denial
+     * would immediately re-open the dialog. A replug gets a new deviceId.
+     */
+    private val deniedPermission = mutableSetOf<Int>()
+    private var accessoryPermissionPending = false
+    private var accessoryPermissionDenied = false
+    private var helloRetry: Runnable? = null
     private lateinit var permissionPi: PendingIntent
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
-                ACTION_PERM -> {
-                    intent.usbAccessoryExtra()?.let(::onAccessoryAttached)
-                    intent.usbDeviceExtra()?.let(::onDeviceAttached)
-                }
+                ACTION_PERM -> onPermissionResult(intent)
                 UsbManager.ACTION_USB_DEVICE_ATTACHED ->
                     intent.usbDeviceExtra()?.let(::onDeviceAttached)
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> onUsbGone()
                 UsbManager.ACTION_USB_ACCESSORY_ATTACHED ->
                     intent.usbAccessoryExtra()?.let(::onAccessoryAttached)
-                UsbManager.ACTION_USB_ACCESSORY_DETACHED -> onUsbGone()
+                UsbManager.ACTION_USB_ACCESSORY_DETACHED -> {
+                    accessoryPermissionPending = false
+                    accessoryPermissionDenied = false
+                    onUsbGone()
+                }
             }
         }
     }
@@ -75,7 +90,10 @@ class MainActivity : Activity() {
         permissionPi = PendingIntent.getBroadcast(
             this, 0,
             Intent(ACTION_PERM).setPackage(packageName),
-            PendingIntent.FLAG_IMMUTABLE
+            // The system fills in EXTRA_DEVICE / EXTRA_ACCESSORY and
+            // EXTRA_PERMISSION_GRANTED, which requires a mutable PendingIntent
+            // (allowed on API 34 because the intent is package-scoped).
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
         )
 
         val filter = IntentFilter().apply {
@@ -234,13 +252,20 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         handler.removeCallbacks(uiLoop)
+        cancelHelloRetry()
         try {
             unregisterReceiver(receiver)
         } catch (_: Exception) {
         }
-        // Leave the link and VPN service alive on purpose: the user may keep
-        // using the LAN with the app in the background. The service tears
-        // everything down when the cable is unplugged.
+        // Leave the link and VPN service alive if the service owns it (or is
+        // about to take it over): the user may keep using the LAN with the
+        // app in the background, and the service tears everything down when
+        // the cable is unplugged. A link nobody else owns would leak.
+        val l = link
+        if (l != null && LanVpnService.activeLink !== l && LanVpnService.pendingLink !== l) {
+            link = null
+            l.close()
+        }
         super.onDestroy()
     }
 
@@ -256,14 +281,48 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Ask the peer to re-enumerate as an Android accessory. */
-    private fun beginHandshake(device: UsbDevice) {
-        val key = "${device.vendorId}:${device.productId}:${device.serialNumber ?: ""}"
-        if (!aoaAttempted.add(key)) return
-        if (!usbManager.hasPermission(device)) {
+    /**
+     * Ask for USB permission at most once per device until the user answers.
+     * Returns true if permission is already granted.
+     */
+    private fun ensureDevicePermission(device: UsbDevice): Boolean {
+        if (usbManager.hasPermission(device)) {
+            pendingPermission.remove(device.deviceId)
+            return true
+        }
+        if (device.deviceId in deniedPermission) return false
+        if (pendingPermission.add(device.deviceId)) {
             usbManager.requestPermission(device, permissionPi)
+        }
+        return false
+    }
+
+    private fun onPermissionResult(intent: Intent) {
+        val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+        val device = intent.usbDeviceExtra()
+        val accessory = intent.usbAccessoryExtra()
+        if (device != null) pendingPermission.remove(device.deviceId)
+        if (accessory != null) accessoryPermissionPending = false
+        // Denied: do not re-request now (that would loop the dialog). The
+        // pending entry is cleared; a replug (new deviceId / new accessory
+        // attach) retries.
+        if (!granted) {
+            if (device != null) deniedPermission.add(device.deviceId)
+            if (accessory != null) accessoryPermissionDenied = true
             return
         }
+        when {
+            accessory != null -> onAccessoryAttached(accessory)
+            device != null -> onDeviceAttached(device)
+        }
+    }
+
+    /** Ask the peer to re-enumerate as an Android accessory. */
+    private fun beginHandshake(device: UsbDevice) {
+        // Permission first; serialNumber and openDevice need it. The grant
+        // broadcast re-enters onDeviceAttached and lands here again.
+        if (!ensureDevicePermission(device)) return
+        if (!aoaAttempted.add(device.deviceId)) return
         runAoaHandshake(device)
     }
 
@@ -277,15 +336,17 @@ class MainActivity : Activity() {
                 val version = if (n == 2)
                     (proto[0].toInt() and 0xFF) or ((proto[1].toInt() and 0xFF) shl 8)
                 else 0
-                if (version >= 1) {
-                    sendAoaString(connection, 0, "USBLan") // manufacturer
-                    sendAoaString(connection, 1, "USBLan") // model
-                    sendAoaString(connection, 3, "1.0")   // version
+                if (version >= 1 &&
+                    sendAoaString(connection, 0, "USBLan") && // manufacturer
+                    sendAoaString(connection, 1, "USBLan") && // model
+                    sendAoaString(connection, 3, "1.0")       // version
+                ) {
                     connection.controlTransfer(0x40, REQ_START, 0, 0, null, 0, 2000)
                     // The peer now re-enumerates as an accessory; we will get
                     // a DETACHED (original device, ignored) and an ATTACHED
                     // (accessory enumeration) handled by connectHost().
                 }
+            } catch (_: Exception) {
             } finally {
                 try {
                     connection.close()
@@ -303,10 +364,7 @@ class MainActivity : Activity() {
     /** This phone is the USB host; talk to the peer which is now an accessory. */
     private fun connectHost(device: UsbDevice) {
         if (link != null || role != Role.NONE) return
-        if (!usbManager.hasPermission(device)) {
-            usbManager.requestPermission(device, permissionPi)
-            return
-        }
+        if (!ensureDevicePermission(device)) return
         val connection = usbManager.openDevice(device) ?: return
         val pair = findBulkPair(device)
         if (pair == null) {
@@ -320,17 +378,54 @@ class MainActivity : Activity() {
         }
         val l = HostLink(Role.HOST, connection, iface, epIn, epOut)
         attachLink(l)
-        l.sendControl("HELLO:1")
+        startHelloLoop(l)
+    }
+
+    /** Host: send HELLO:1, resend if no READY within HELLO_RETRY_MS, give up after 3 tries. */
+    private fun startHelloLoop(l: Link) {
+        cancelHelloRetry()
+        var attempts = 0
+        val r = object : Runnable {
+            override fun run() {
+                if (link !== l || handshakeDone) {
+                    if (helloRetry === this) helloRetry = null
+                    return
+                }
+                if (attempts >= HELLO_MAX_ATTEMPTS) {
+                    helloRetry = null
+                    l.close() // onClosed resets the UI state
+                    return
+                }
+                attempts++
+                l.sendControl("HELLO:1")
+                handler.postDelayed(this, HELLO_RETRY_MS)
+            }
+        }
+        helloRetry = r
+        r.run()
+    }
+
+    private fun cancelHelloRetry() {
+        helloRetry?.let(handler::removeCallbacks)
+        helloRetry = null
     }
 
     /** This phone is in accessory mode; the host opened us. */
     private fun onAccessoryAttached(accessory: UsbAccessory) {
         if (link != null || role != Role.NONE) return
         if (!usbManager.hasPermission(accessory)) {
-            usbManager.requestPermission(accessory, permissionPi)
+            if (!accessoryPermissionPending && !accessoryPermissionDenied) {
+                accessoryPermissionPending = true
+                usbManager.requestPermission(accessory, permissionPi)
+            }
             return
         }
-        val pfd = usbManager.openAccessory(accessory) ?: return
+        accessoryPermissionPending = false
+        val pfd = try {
+            usbManager.openAccessory(accessory)
+        } catch (_: Exception) {
+            null
+        } ?: return
         attachLink(AccessoryLink(Role.DEVICE, pfd))
     }
 
@@ -342,6 +437,7 @@ class MainActivity : Activity() {
         l.onClosed = {
             handler.post {
                 if (link === l) {
+                    cancelHelloRetry()
                     link = null
                     role = Role.NONE
                     handshakeDone = false
@@ -349,23 +445,31 @@ class MainActivity : Activity() {
                 }
             }
         }
+        // Callbacks are in place; only now may the reader see frames.
+        l.start()
         render()
     }
 
     private fun onControlMessage(message: String) {
         when {
             message == "HELLO:1" && role == Role.DEVICE -> {
+                // The host may resend HELLO if our READY was lost; always answer.
                 link?.sendControl("READY")
                 handler.post {
-                    handshakeDone = true
-                    startVpn()
+                    if (!handshakeDone) {
+                        handshakeDone = true
+                        startVpn()
+                    }
                     render()
                 }
             }
             message == "READY" && role == Role.HOST -> {
                 handler.post {
-                    handshakeDone = true
-                    startVpn()
+                    cancelHelloRetry()
+                    if (!handshakeDone) {
+                        handshakeDone = true
+                        startVpn()
+                    }
                     render()
                 }
             }
@@ -376,6 +480,7 @@ class MainActivity : Activity() {
         // Any detach while a link exists tears it down; the AOA re-enumeration
         // detach happens before the link exists and is therefore a no-op.
         val l = link ?: return
+        cancelHelloRetry()
         link = null
         role = Role.NONE
         handshakeDone = false

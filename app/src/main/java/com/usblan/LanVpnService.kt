@@ -46,36 +46,53 @@ class LanVpnService : VpnService() {
     override fun onBind(intent: Intent): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val l = pendingLink
-        if (l == null) {
+        try {
+            handleStart()
+        } catch (_: Exception) {
+            // Never crash-loop: drop everything and stop.
+            stopping.set(true)
+            cleanup()
             stopSelf()
-            return START_NOT_STICKY
         }
+        return START_NOT_STICKY
+    }
+
+    private fun handleStart() {
+        val l = pendingLink
         pendingLink = null
 
-        if (activeLink != null && activeLink !== l) {
-            l.close()
-            stopSelf()
-            return START_NOT_STICKY
+        // Started via startForegroundService(): call startForeground() before
+        // any early exit, otherwise the system kills the app with
+        // ForegroundServiceDidNotStartInTimeException.
+        startForeground(1, buildNotification(l?.role ?: activeLink?.role ?: Role.NONE))
+
+        if (l == null) {
+            if (activeLink == null) stopSelf()
+            return
         }
 
-        startForeground(1, buildNotification(l.role))
+        if (activeLink != null && activeLink !== l) {
+            // Already serving another link; reject the newcomer without
+            // tearing down the active LAN.
+            l.close()
+            return
+        }
 
         if (activeLink == null) {
             link = l
             activeLink = l
             val fd = createTun(l.role)
             if (fd == null) {
+                stopping.set(true)
                 cleanup()
                 stopSelf()
-                return START_NOT_STICKY
+                return
             }
             tun = fd
             tunIn = FileInputStream(fd.fileDescriptor)
             tunOut = FileOutputStream(fd.fileDescriptor)
             startPumps(l)
         }
-        return START_NOT_STICKY
     }
 
     private fun createTun(role: Role): ParcelFileDescriptor? = try {
@@ -84,6 +101,7 @@ class LanVpnService : VpnService() {
             .setMtu(MTU)
             .addAddress(myIp(role), 24)
             .addRoute("$SUBNET.0", 24)
+            .setBlocking(true) // the TUN reader thread does blocking reads
             .establish()
     } catch (_: Exception) {
         null
@@ -103,7 +121,15 @@ class LanVpnService : VpnService() {
                 }
             }
         }
-        l.onClosed = { requestStop() }
+        // Chain, don't replace: MainActivity's cleanup callback must still run.
+        val previousOnClosed = l.onClosed
+        l.onClosed = {
+            try {
+                previousOnClosed?.invoke()
+            } finally {
+                requestStop()
+            }
+        }
 
         // TUN -> USB: packets local apps send to the LAN are forwarded to the peer.
         Thread {
@@ -158,8 +184,11 @@ class LanVpnService : VpnService() {
             NotificationChannel(channelId, "USB LAN", NotificationManager.IMPORTANCE_LOW)
         )
         return Notification.Builder(this, channelId)
-            .setContentTitle("USB LAN is up")
-            .setContentText("This phone ${myIp(role)} - peer ${peerIp(role)}")
+            .setContentTitle(if (role == Role.NONE) "USB LAN" else "USB LAN is up")
+            .setContentText(
+                if (role == Role.NONE) "Starting"
+                else "This phone ${myIp(role)} - peer ${peerIp(role)}"
+            )
             .setSmallIcon(R.drawable.ic_launcher)
             .setOngoing(true)
             .build()
